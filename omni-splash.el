@@ -1,7 +1,7 @@
 ;;; omni-splash.el --- Ephemeral pixel-centered splash launcher -*- lexical-binding: t; -*-
 
 ;; Author: Bari Garnier
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, frames, launcher
 ;; URL: https://github.com/bari-garnier/omni-splash
@@ -19,13 +19,14 @@
 ;; - Three built-in layouts: `two-column', `single-column', and `banner-only'.
 ;; - Two dispatch workflows: two-step visual key hub (default) or one-step
 ;;   immediate prompt (`omni-splash-initial-action').
-;; - Unified frame lifecycle across daemon (`emacsclient -c') and standalone
-;;   (`emacs -Q -l ...') invocations, including clean `C-g' dismissal.
+;; - Built-in standalone exporter (`omni-splash-export-standalone') that
+;;   generates and byte-compiles a fast `-Q' boot file from your live config.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'subr-x)
+
 (defvar server-client-instructions)
 
 ;;;; Customization
@@ -131,6 +132,52 @@ In `single-column' layout, column specs are rendered sequentially."
                                 (function :tag "Command")))))))
   :group 'omni-splash)
 
+;;;; Standalone Exporter Options
+
+(defcustom omni-splash-standalone-file
+  (expand-file-name "var/omni-splash-standalone.el" user-emacs-directory)
+  "Output path for the generated fast `-Q' standalone boot file."
+  :type 'file
+  :group 'omni-splash)
+
+(defcustom omni-splash-standalone-packages nil
+  "List of library symbols whose `load-path' directories should be exported.
+Transitive package dependencies declared in package headers are resolved
+automatically when `omni-splash-export-standalone' runs."
+  :type '(repeat symbol)
+  :group 'omni-splash)
+
+(defcustom omni-splash-standalone-files nil
+  "List of Elisp files loaded at the end of the generated standalone file.
+Use this to load your personal launcher actions (e.g., `omni-actions.el')
+without loading your full Emacs configuration."
+  :type '(repeat file)
+  :group 'omni-splash)
+
+(defcustom omni-splash-standalone-completion 'vertico
+  "Completion UI enabled in the generated standalone boot file.
+- `vertico': Enable `vertico-mode' (and `orderless' if on `load-path'),
+  falling back to `fido-vertical-mode'.
+- `fido': Always use built-in `fido-vertical-mode'.
+- `none': Do not configure a completion UI automatically."
+  :type '(choice (const :tag "Vertico + Orderless (with Fido fallback)" vertico)
+                 (const :tag "Built-in Fido vertical" fido)
+                 (const :tag "None" none))
+  :group 'omni-splash)
+
+(defcustom omni-splash-standalone-frame-alist
+  '((undecorated . t)
+    (alpha-background . 92)
+    (internal-border-width . 24)
+    (menu-bar-lines . 0)
+    (tool-bar-lines . 0)
+    (vertical-scroll-bars . nil)
+    (horizontal-scroll-bars . nil)
+    (cursor-type . nil))
+  "Additional `default-frame-alist' entries written into the standalone file."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'omni-splash)
+
 ;;;; Faces
 
 (defface omni-splash-title
@@ -186,17 +233,12 @@ In `single-column' layout, column specs are rendered sequentially."
   "Call interactive COMMAND inside the splash frame.
 Unless KEEP-FRAME is non-nil, close the splash frame once COMMAND
 completes or is aborted with `quit' (\\[keyboard-quit])."
-  (let ((frame (selected-frame))
-        (completed nil))
+  (let ((frame (selected-frame)))
     (unwind-protect
         (condition-case nil
-            (progn
-              (call-interactively command)
-              (setq completed t))
+            (call-interactively command)
           (quit nil))
-      (when (and (not keep-frame)
-                 (frame-live-p frame)
-                 (or completed t))
+      (when (and (not keep-frame) (frame-live-p frame))
         (omni-splash-close frame)))))
 
 (defun omni-splash--wrap-command (command)
@@ -456,6 +498,150 @@ rendering the splash frame."
     (setq server-client-instructions nil)
     (when (functionp omni-splash-initial-action)
       (run-at-time 0 nil #'omni-splash-run omni-splash-initial-action))))
+
+;;;; Standalone `-Q' Boot-File Generator
+
+(defun omni-splash--collect-package-dirs (packages)
+  "Resolve `load-path' directories for PACKAGES and their dependencies."
+  (require 'package)
+  (let ((queue (copy-sequence (cons 'omni-splash packages)))
+        (seen (make-hash-table :test 'eq))
+        (dirs nil))
+    (while queue
+      (let ((pkg (pop queue)))
+        (unless (gethash pkg seen)
+          (puthash pkg t seen)
+          (when-let* ((lib (locate-library (symbol-name pkg))))
+            (let ((dir (directory-file-name (file-name-directory lib))))
+              ;; Never capture built-in Emacs lisp/ dirs
+              (unless (string-prefix-p (expand-file-name data-directory)
+                                       (expand-file-name dir))
+                (cl-pushnew dir dirs :test #'equal)))
+            (when (fboundp 'package--dependencies)
+              (dolist (dep (ignore-errors (package--dependencies pkg)))
+                (unless (gethash dep seen)
+                  (push dep queue))))))))
+    (nreverse dirs)))
+
+(defun omni-splash--snapshot-faces ()
+  "Capture current frame typography and editorial colors as face specs."
+  (let ((valid-color (lambda (c) (and (stringp c) (not (string-prefix-p "unspecified" c))))))
+    `((default
+       :family ,(face-attribute 'default :family nil t)
+       :height ,(face-attribute 'default :height nil t)
+       ,@(let ((bg (face-attribute 'default :background nil t)))
+           (when (funcall valid-color bg) `(:background ,bg)))
+       ,@(let ((fg (face-attribute 'default :foreground nil t)))
+           (when (funcall valid-color fg) `(:foreground ,fg))))
+      (fixed-pitch
+       :family ,(face-attribute 'fixed-pitch :family nil t)
+       :height ,(face-attribute 'fixed-pitch :height nil t))
+      (variable-pitch
+       :family ,(face-attribute 'variable-pitch :family nil t)
+       :height ,(face-attribute 'variable-pitch :height nil t))
+      (font-lock-keyword-face
+       ,@(let ((fg (face-attribute 'font-lock-keyword-face :foreground nil t)))
+           (when (funcall valid-color fg) `(:foreground ,fg)))
+       :weight ,(face-attribute 'font-lock-keyword-face :weight nil t))
+      (shadow
+       ,@(let ((fg (face-attribute 'shadow :foreground nil t)))
+           (when (funcall valid-color fg) `(:foreground ,fg))))
+      (minibuffer-prompt
+       ,@(let ((fg (face-attribute 'minibuffer-prompt :foreground nil t)))
+           (when (funcall valid-color fg) `(:foreground ,fg)))
+       :weight ,(face-attribute 'minibuffer-prompt :weight nil t)))))
+
+;;;###autoload
+(defun omni-splash-export-standalone (&optional file)
+  "Generate and byte-compile a fast `-Q' standalone boot file at FILE.
+Defaults to `omni-splash-standalone-file'.  Captures resolved `load-path'
+directories for `omni-splash-standalone-packages', active fonts and face
+colors, `omni-splash' settings, and `omni-splash-standalone-files'."
+  (interactive)
+  (let* ((target (expand-file-name (or file omni-splash-standalone-file)))
+         (dirs (omni-splash--collect-package-dirs omni-splash-standalone-packages))
+         (faces (omni-splash--snapshot-faces))
+         (extra-files (mapcar #'expand-file-name omni-splash-standalone-files))
+         (frame-alist `((name . ,omni-splash-frame-name)
+                        (title . ,omni-splash-frame-name)
+                        ,@omni-splash-standalone-frame-alist)))
+    (make-directory (file-name-directory target) t)
+    (with-temp-file target
+      (let ((print-length nil)
+            (print-level nil))
+        (insert ";;; " (file-name-nondirectory target)
+                " --- Auto-generated by `omni-splash-export-standalone' -*- lexical-binding: t; -*-\n\n")
+        (insert "(defvar omni-splash--saved-fnh file-name-handler-alist)\n"
+                "(setq gc-cons-threshold most-positive-fixnum\n"
+                "      gc-cons-percentage 0.6\n"
+                "      file-name-handler-alist nil\n"
+                "      inhibit-startup-screen t\n"
+                "      inhibit-startup-message t\n"
+                "      inhibit-startup-echo-area-message user-login-name\n"
+                "      initial-scratch-message nil\n"
+                "      frame-inhibit-implied-resize t\n"
+                "      ring-bell-function #'ignore\n"
+                "      use-short-answers t\n"
+                "      create-lockfiles nil\n"
+                "      make-backup-files nil\n"
+                "      auto-save-default nil)\n\n"
+                "(add-hook 'emacs-startup-hook\n"
+                "          (lambda ()\n"
+                "            (setq gc-cons-threshold (* 16 1024 1024)\n"
+                "                  gc-cons-percentage 0.1\n"
+                "                  file-name-handler-alist omni-splash--saved-fnh)))\n\n"
+                "(menu-bar-mode -1)\n"
+                "(tool-bar-mode -1)\n"
+                "(scroll-bar-mode -1)\n\n")
+        (pp `(setq default-frame-alist ',frame-alist) (current-buffer))
+        (insert "\n")
+        (pp `(eval-and-compile
+               (dolist (dir ',dirs)
+                 (when (file-directory-p dir)
+                   (add-to-list 'load-path dir))))
+            (current-buffer))
+        (insert "\n")
+        (pp `(defun omni-splash--apply-exported-faces (&optional frame)
+               (with-selected-frame (or frame (selected-frame))
+                 (when (display-graphic-p)
+                   (dolist (spec ',faces)
+                     (apply #'set-face-attribute (car spec) nil (cdr spec))))))
+            (current-buffer))
+        (insert "\n(add-hook 'after-make-frame-functions #'omni-splash--apply-exported-faces)\n"
+                "(omni-splash--apply-exported-faces)\n\n")
+        (pcase omni-splash-standalone-completion
+          ('vertico
+           (insert "(defun omni-splash--lazy-completion ()\n"
+                   "  (remove-hook 'minibuffer-setup-hook #'omni-splash--lazy-completion)\n"
+                   "  (if (require 'vertico nil t)\n"
+                   "      (vertico-mode 1)\n"
+                   "    (fido-vertical-mode 1))\n"
+                   "  (when (require 'orderless nil t)\n"
+                   "    (setq completion-styles '(orderless basic)\n"
+                   "          completion-category-defaults nil\n"
+                   "          completion-category-overrides '((file (styles partial-completion))))))\n"
+                   "(add-hook 'minibuffer-setup-hook #'omni-splash--lazy-completion)\n\n"))
+          ('fido
+           (insert "(fido-vertical-mode 1)\n\n")))
+        (insert "(require 'omni-splash)\n")
+        (pp `(setq omni-splash-title ,omni-splash-title
+                   omni-splash-layout ',omni-splash-layout
+                   omni-splash-show-rules ,omni-splash-show-rules
+                   omni-splash-show-footer ,omni-splash-show-footer
+                   omni-splash-quit-key ,omni-splash-quit-key
+                   omni-splash-quit-label ,omni-splash-quit-label
+                   omni-splash-column-gap ,omni-splash-column-gap
+                   omni-splash-initial-action ',omni-splash-initial-action
+                   omni-splash-sections ',omni-splash-sections)
+            (current-buffer))
+        (insert "\n")
+        (dolist (ef extra-files)
+          (pp `(load ,ef nil t) (current-buffer))
+          (insert "\n"))))
+    (byte-compile-file target)
+    (when (called-interactively-p 'any)
+      (message "Exported and compiled %s" target))
+    target))
 
 (provide 'omni-splash)
 ;;; omni-splash.el ends here
