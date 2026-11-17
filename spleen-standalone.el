@@ -50,9 +50,25 @@ Bound variables referenced by exported functions are also considered."
   :type '(repeat file)
   :group 'spleen)
 
-(defcustom spleen-standalone-completion 'vertico
+(defcustom spleen-standalone-setup nil
+  "Forms to write into the generated standalone init file.
+Write a quoted list of Lisp forms in your normal config, for example:
+
+  (setq spleen-standalone-setup
+        '((setq icomplete-compute-delay 0
+                icomplete-show-matches-on-no-input t)))
+
+The forms run in the standalone Emacs, not in the exporting session.
+They appear after `spleen-standalone-files' and before the splash opens.
+For third-party libraries, also arrange for their directories to be
+exported via `spleen-standalone-packages'."
+  :type '(repeat sexp)
+  :group 'spleen)
+
+(defcustom spleen-standalone-completion 'fido
   "Completion UI configured in the standalone profile.
-Vertico falls back to Fido when unavailable."
+Fido is built into Emacs.  The optional Vertico choice currently falls
+back to Fido when unavailable."
   :type '(choice (const :tag "Vertico + Orderless (Fido fallback)" vertico)
                  (const :tag "Fido vertical" fido)
                  (const :tag "None" none))
@@ -87,8 +103,7 @@ Vertico falls back to Fido when unavailable."
 (defun spleen--collect-package-dirs (packages)
   "Resolve library directories for PACKAGES and discoverable dependencies."
   (require 'package)
-  (let ((queue (copy-sequence
-                (append '(spleen spleen-actions) packages)))
+  (let ((queue (copy-sequence (append '(spleen spleen-actions) packages)))
         (seen (make-hash-table :test 'eq))
         dirs)
     (while queue
@@ -315,16 +330,8 @@ initialization files in DIRECTORY are overwritten."
                 "(spleen--apply-exported-faces)\n\n")
         (pcase spleen-standalone-completion
           ('vertico
-           (insert "(defun spleen--lazy-completion ()\n"
-                   "  (remove-hook 'minibuffer-setup-hook #'spleen--lazy-completion)\n"
-                   "  (if (and (require 'vertico nil t) (fboundp 'vertico-mode))\n"
-                   "      (funcall 'vertico-mode 1)\n"
-                   "    (fido-vertical-mode 1))\n"
-                   "  (when (require 'orderless nil t)\n"
-                   "    (setq completion-styles '(orderless basic)\n"
-                   "          completion-category-defaults nil\n"
-                   "          completion-category-overrides '((file (styles partial-completion))))))\n"
-                   "(add-hook 'minibuffer-setup-hook #'spleen--lazy-completion)\n\n"))
+           (insert "(require 'vertico)\n"
+                   "(vertico-mode 1)\n\n"))
           ('fido (insert "(fido-vertical-mode 1)\n\n")))
         (insert "(require 'spleen)\n(require 'spleen-actions)\n\n")
         (dolist (v user-vars)
@@ -341,6 +348,7 @@ initialization files in DIRECTORY are overwritten."
                    spleen-quit-key ,spleen-quit-key
                    spleen-quit-label ,spleen-quit-label
                    spleen-column-gap ,spleen-column-gap
+                   spleen-cancel-behavior ',spleen-cancel-behavior
                    spleen-terminal-program ,spleen-terminal-program
                    spleen-terminal-args ',spleen-terminal-args
                    spleen-terminal-hold ',spleen-terminal-hold
@@ -352,6 +360,18 @@ initialization files in DIRECTORY are overwritten."
         (insert "\n")
         (dolist (file extra-files)
           (pp `(load ,file nil t) (current-buffer)))
+        ;; These are code forms, not quoted data: evaluate them at standalone
+        ;; startup after optional files and before initial-buffer-choice.
+        (when spleen-standalone-setup
+          (unless (and (listp spleen-standalone-setup)
+                       (proper-list-p spleen-standalone-setup))
+            (user-error "spleen-standalone-setup must be a proper list of forms"))
+          (insert "\n")
+          (dolist (form spleen-standalone-setup)
+            (unless (spleen--printable-p form)
+              (user-error "Unprintable form in spleen-standalone-setup: %S" form))
+            (pp form (current-buffer))
+            (insert "\n")))
         (insert "\n(setq initial-buffer-choice\n"
                 "      (lambda ()\n"
                 "        (spleen-show)\n"

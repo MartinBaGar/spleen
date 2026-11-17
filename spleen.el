@@ -9,21 +9,9 @@
 ;;; Commentary:
 
 ;; Spleen is a keyboard-driven splash screen and ephemeral action hub.
-;;
-;; This file contains the screen, layout engine, command dispatch and
-;; extension helpers.  Default actions live in spleen-actions.el and the
-;; optional standalone exporter lives in spleen-standalone.el.  Keep all
-;; three files in the same directory on `load-path'.
-;;
-;; Default bindings:
-;;   a  Launch app
-;;   r  Run command
-;;   t  Run in terminal
-;;   k  Kill process
-;;
-;; Extend the menu with `spleen-add-section'.  The action and exporter
-;; entry points are explicitly autoloaded below so loading this file
-;; directly also works without generated package autoloads.
+;; Default actions live in spleen-actions.el; standalone export lives in
+;; spleen-standalone.el.  Keep the three libraries on `load-path'.
+;; Extend the menu with `spleen-add-section'.
 
 ;;; Code:
 
@@ -83,12 +71,23 @@ Set to nil or an empty string to omit the title."
   :group 'spleen)
 
 (defcustom spleen-initial-action nil
-  "Optional interactive command to run immediately when `spleen-show' opens.
-When nil, display the splash screen and wait for a shortcut key.
-When non-nil, render the splash buffer first and immediately invoke this
-command via `spleen-run'."
+  "Optional interactive command to run when `spleen-show' opens.
+Use a command such as `spleen-launch-app', not a quoted call to
+`find-file'.  A canceled initial action follows
+`spleen-cancel-behavior' and is not launched again on return."
   :type '(choice (const :tag "Two-step (wait for shortcut key)" nil)
                  (function :tag "One-step (run command immediately)"))
+  :group 'spleen)
+
+(defcustom spleen-cancel-behavior 'close
+  "What to do when an action is aborted with C-g.
+`close' closes the splash (the existing behavior); `return' leaves the
+splash open, restoring its buffer if the action changed it.  This also
+applies to `spleen-initial-action'.  Individual menu entries may
+specify :on-cancel close or :on-cancel return to override it.
+Successful actions still close unless invoked with KEEP-FRAME."
+  :type '(choice (const :tag "Close splash" close)
+                 (const :tag "Return to splash" return))
   :group 'spleen)
 
 (defcustom spleen-quit-function #'spleen-default-quit
@@ -126,25 +125,36 @@ command via `spleen-run'."
       ("t" "Run in terminal" spleen-run-in-terminal))
      ("SYSTEM"
       ("k" "Kill process"    spleen-kill-process))))
-  "Menu specification displayed by `spleen'.
-Each element is a row-group of one or two column specs:
-  ((LEFT-TITLE (KEY DESC COMMAND) ...)
-   (RIGHT-TITLE (KEY DESC COMMAND) ...))
-In `single-column' layout, column specs are rendered sequentially.
-Use `spleen-add-section' to extend the menu without editing this list."
+  "Menu specification displayed by Spleen.
+Each element is a row of one or two columns:
+  ((TITLE (KEY DESC COMMAND [OPTIONS...]) ...)
+   (TITLE (KEY DESC COMMAND [OPTIONS...]) ...))
+Optional item properties form a plist after COMMAND; currently the
+supported option is :on-cancel close or :on-cancel return.  Use
+`spleen-add-section' to extend the menu without editing this list."
   :type '(repeat
           (list
            (cons :tag "Left column"
                  (string :tag "Section title")
-                 (repeat (list (string :tag "Key")
-                               (string :tag "Description")
-                               (function :tag "Command"))))
+                 (repeat
+                  (choice
+                   (list (string :tag "Key") (string :tag "Description")
+                         (function :tag "Command"))
+                   (list (string :tag "Key") (string :tag "Description")
+                         (function :tag "Command")
+                         (const :on-cancel)
+                         (choice (const close) (const return))))))
            (option
             (cons :tag "Right column"
                   (string :tag "Section title")
-                  (repeat (list (string :tag "Key")
-                                (string :tag "Description")
-                                (function :tag "Command")))))))
+                  (repeat
+                   (choice
+                    (list (string :tag "Key") (string :tag "Description")
+                          (function :tag "Command"))
+                    (list (string :tag "Key") (string :tag "Description")
+                          (function :tag "Command")
+                          (const :on-cancel)
+                          (choice (const close) (const return)))))))))
   :group 'spleen)
 
 ;;;; Faces
@@ -182,6 +192,9 @@ Use `spleen-add-section' to extend the menu without editing this list."
 (defvar-local spleen--block-px nil
   "Pixel width of the rendered menu block, used to size hairline rules.")
 
+(defvar-local spleen--initial-token nil
+  "Identity of the pending initial-action timer, or nil.")
+
 ;;;; Frame Lifecycle & Command Dispatch
 
 (defun spleen-default-quit (&optional frame)
@@ -197,24 +210,39 @@ Use `spleen-add-section' to extend the menu without editing this list."
   (interactive)
   (funcall spleen-quit-function (or frame (selected-frame))))
 
-;;;###autoload
-(defun spleen-run (command &optional keep-frame)
-  "Call interactive COMMAND inside the splash frame.
-Unless KEEP-FRAME is non-nil, close the splash frame once COMMAND
-completes or is aborted with `quit' (\\[keyboard-quit])."
-  (let ((frame (selected-frame)))
-    (unwind-protect
-        (condition-case nil
-            (call-interactively command)
-          (quit nil))
-      (when (and (not keep-frame) (frame-live-p frame))
-        (spleen-close frame)))))
+(defun spleen--restore-splash (frame buffer)
+  "Show the already-rendered splash BUFFER in FRAME without restarting it."
+  (when (and (frame-live-p frame) (buffer-live-p buffer))
+    (with-selected-frame frame
+      (switch-to-buffer buffer)
+      (delete-other-windows)
+      (spleen--recenter-window (selected-window)))))
 
-(defun spleen--wrap-command (command)
-  "Return an interactive wrapper invoking COMMAND via `spleen-run'."
+;;;###autoload
+(defun spleen-run (command &optional keep-frame on-cancel)
+  "Call interactive COMMAND inside the splash frame.
+Unless KEEP-FRAME is non-nil, close the splash after success.  On a
+`quit' (normally C-g), use ON-CANCEL if non-nil, otherwise
+`spleen-cancel-behavior'.  The choices are `close' and `return'.
+Other errors propagate without closing the frame."
+  (let ((frame (selected-frame))
+        (buffer (current-buffer)))
+    (condition-case nil
+        (prog1 (call-interactively command)
+          (when (and (not keep-frame) (frame-live-p frame))
+            (spleen-close frame)))
+      (quit
+       (if (eq (or on-cancel spleen-cancel-behavior) 'return)
+           (spleen--restore-splash frame buffer)
+         (when (frame-live-p frame)
+           (spleen-close frame)))
+       nil))))
+
+(defun spleen--wrap-command (command &optional on-cancel)
+  "Return an interactive wrapper for COMMAND with ON-CANCEL behavior."
   (lambda ()
     (interactive)
-    (spleen-run command)))
+    (spleen-run command nil on-cancel)))
 
 (defun spleen--build-keymap ()
   "Construct a keymap from `spleen-sections' and `spleen-quit-key'."
@@ -223,34 +251,56 @@ completes or is aborted with `quit' (\\[keyboard-quit])."
     (dolist (pair spleen-sections)
       (dolist (col pair)
         (dolist (item (cdr col))
-          (pcase-let ((`(,key ,_desc ,cmd) item))
-            (when (and (stringp key) (not (string-empty-p key)) (functionp cmd))
-              (define-key map (kbd key) (spleen--wrap-command cmd)))))))
+          (pcase-let ((`(,key ,_desc ,cmd . ,options) item))
+            (when (and (stringp key) (not (string-empty-p key))
+                       (commandp cmd t))
+              (define-key map (kbd key)
+                          (spleen--wrap-command cmd
+                                                (plist-get options :on-cancel))))))))
     (when (and (stringp spleen-quit-key)
                (not (string-empty-p spleen-quit-key)))
       (define-key map (kbd spleen-quit-key) #'spleen-close))
     map))
 
+(defun spleen--merge-items (existing incoming)
+  "Merge INCOMING into EXISTING by key, replacing in place.
+Repeated keys already in EXISTING are removed.  New keys are appended."
+  (let ((result (copy-sequence existing)))
+    (dolist (item incoming)
+      (let ((replaced nil)
+            (updated nil))
+        (dolist (old result)
+          (if (equal (car old) (car item))
+              (unless replaced
+                (push item updated)
+                (setq replaced t))
+            (push old updated)))
+        (setq result (if replaced
+                         (nreverse updated)
+                       (append result (list item))))))
+    result))
+
 ;;;###autoload
 (defun spleen-add-section (title items)
-  "Add ITEMS, a list of (KEY DESC COMMAND), under the section named TITLE.
-If a section called TITLE already exists, ITEMS are appended to it.
-Otherwise a new section is created: in the right-hand column of the
-last row if that column is free, or in a new row.
-Returns the updated value of `spleen-sections'."
+  "Add ITEMS under section TITLE, replacing existing items with the same key.
+ITEMS is a list of (KEY DESC COMMAND [OPTIONS...]).  Calling this again
+with the same keys updates actions in place instead of duplicating them.
+A new section is placed in the last row's free right column, or in a
+new row.  Return the updated value of `spleen-sections'."
   (let ((found nil))
     (setq spleen-sections
           (mapcar (lambda (row)
                     (mapcar (lambda (col)
                               (if (equal (car col) title)
                                   (progn (setq found t)
-                                         (append col items))
+                                         (cons title
+                                               (spleen--merge-items (cdr col) items)))
                                 col))
                             row))
                   spleen-sections))
     (unless found
       (let ((last-row (car (last spleen-sections)))
-            (new (cons title items)))
+            (new (cons title (spleen--merge-items nil items))))
         (setq spleen-sections
               (if (and last-row (= (length last-row) 1))
                   (append (butlast spleen-sections)
@@ -335,8 +385,8 @@ When NO-NEWLINE is non-nil, omit the trailing newline."
   (propertize title 'face 'spleen-section))
 
 (defun spleen--format-item (item)
-  "Propertize menu ITEM (KEY DESC COMMAND)."
-  (pcase-let ((`(,key ,desc ,_cmd) item))
+  "Propertize menu ITEM (KEY DESC COMMAND [OPTIONS...])."
+  (pcase-let ((`(,key ,desc ,_cmd . ,_options) item))
     (concat (propertize key 'face 'spleen-key)
             (propertize "  " 'face 'fixed-pitch)
             (propertize desc 'face 'spleen-description))))
@@ -462,13 +512,15 @@ HAS-BODY indicates whether menu items or a footer follow."
 ;;;###autoload
 (defun spleen-show ()
   "Render and display the full-frame Spleen splash screen.
-If `spleen-initial-action' is non-nil, invoke it immediately after
-rendering the splash frame."
+If `spleen-initial-action' is non-nil, invoke it in this frame after
+rendering.  A canceled initial action can return without restarting it."
   (interactive)
   (let ((buffer (get-buffer-create spleen-buffer-name))
         (frame (selected-frame))
         (show-menu (not (eq spleen-layout 'banner-only))))
     (with-current-buffer buffer
+      ;; Any older pending callback must not launch after a fresh show.
+      (setq spleen--initial-token nil)
       (when (overlayp spleen--top-pad-overlay)
         (delete-overlay spleen--top-pad-overlay)
         (setq spleen--top-pad-overlay nil))
@@ -511,8 +563,25 @@ rendering the splash frame."
       (unless (frame-visible-p frame)
         (make-frame-visible frame)))
     (setq server-client-instructions nil)
-    (when (functionp spleen-initial-action)
-      (run-at-time 0 nil #'spleen-run spleen-initial-action))))
+    (when spleen-initial-action
+      (unless (commandp spleen-initial-action t)
+        (user-error "spleen-initial-action must be an interactive command: %S"
+                    spleen-initial-action))
+      (let ((command spleen-initial-action)
+            (token (list 'spleen-initial-action)))
+        (with-current-buffer buffer
+          (setq spleen--initial-token token))
+        (run-at-time
+         0 nil
+         (lambda ()
+           (when (and (frame-live-p frame)
+                      (buffer-live-p buffer)
+                      (eq (buffer-local-value 'spleen--initial-token buffer) token)
+                      (eq (window-buffer (frame-selected-window frame)) buffer))
+             (with-current-buffer buffer
+               (setq spleen--initial-token nil))
+             (with-selected-frame frame
+               (spleen-run command)))))))))
 
 (provide 'spleen)
 ;;; spleen.el ends here
